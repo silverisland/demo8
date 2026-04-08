@@ -1,0 +1,15 @@
+[workspace]
+authors = ["JeremyH <han0414@outlook.com>"]
+channels = ["conda-forge"]
+name = "demo8"
+platforms = ["osx-arm64"]
+version = "0.1.0"
+
+[tasks]
+
+[dependencies]
+pvlib = ">=0.15.0,<0.16"
+numpy = ">=2.4.3,<3"
+pandas = ">=3.0.2,<4"
+pytorch = ">=2.10.0,<3"
+scikit-learn = ">=1.8.0,<2"
