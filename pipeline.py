@@ -50,13 +50,14 @@ class PVGenerationPipeline:
         """
         self.generator.eval()
         with torch.no_grad():
-            # Sampling from Diffusion Model
+            # Sampling from Diffusion Model with step-by-step physical constraints
             p_gen = self.generator.sample(
                 nwp=nwp_seq.to(self.device), 
-                site_latent=site_latent.to(self.device)
+                site_latent=site_latent.to(self.device),
+                ghi_clearsky=ghi_clearsky.to(self.device)
             )
             
-            # --- Physical Bounding (Hard Constraint) ---
+            # --- Physical Bounding (Hard Constraint Safety Layer) ---
             # 1. Non-negativity
             p_gen = torch.clamp(p_gen, min=0.0)
             # 2. Clear-sky Upper Bound

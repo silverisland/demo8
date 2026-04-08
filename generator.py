@@ -42,6 +42,22 @@ class ResidualBlock1D(nn.Module):
         h = F.relu(self.norm2(self.conv2(h)))
         return h + self.shortcut(x)
 
+class NWPEncoder(nn.Module):
+    """
+    Encodes the NWP sequence into a feature map.
+    """
+    def __init__(self, nwp_dim: int, hidden_dim: int):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv1d(nwp_dim, hidden_dim, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1)
+        )
+
+    def forward(self, nwp: torch.Tensor) -> torch.Tensor:
+        # nwp: [B, C, L]
+        return self.conv(nwp)
+
 class EpsilonNet(nn.Module):
     """
     Backbone for the Diffusion Model (1D ResNet).
@@ -49,20 +65,33 @@ class EpsilonNet(nn.Module):
     """
     def __init__(self, nwp_dim: int, site_latent_dim: int, hidden_dim: int = 128):
         super().__init__()
-        # Total condition dimension: NWP at each step + TimeStep embedding + Site Latent
+        self.hidden_dim = hidden_dim
+        
+        # 1. Time Embedding
         self.time_mlp = nn.Sequential(
             TimeStepEmbedding(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU()
         )
         
-        # Initial projection of power sequence
+        # 2. NWP Sequence Encoder
+        self.nwp_encoder = NWPEncoder(nwp_dim, hidden_dim)
+        
+        # 3. Initial projection of noisy power
         self.init_conv = nn.Conv1d(1, hidden_dim, kernel_size=3, padding=1)
         
-        # Stacks of residual blocks
-        # Condition for blocks = NWP (per-step) + TimeStep + Site Latent
-        self.block1 = ResidualBlock1D(hidden_dim, hidden_dim, nwp_dim + hidden_dim + site_latent_dim)
-        self.block2 = ResidualBlock1D(hidden_dim, hidden_dim, nwp_dim + hidden_dim + site_latent_dim)
+        # 4. Global condition dimension (Time + Site Latent)
+        global_cond_dim = hidden_dim + site_latent_dim
+        
+        # 5. Residual Blocks (Increased depth to 4)
+        # We concatenate encoded NWP (hidden_dim) with input (hidden_dim), 
+        # so block input is 2*hidden_dim or we use a fusion layer.
+        self.fusion = nn.Conv1d(hidden_dim * 2, hidden_dim, 1)
+        
+        self.blocks = nn.ModuleList([
+            ResidualBlock1D(hidden_dim, hidden_dim, global_cond_dim)
+            for _ in range(4)
+        ])
         
         self.final_conv = nn.Conv1d(hidden_dim, 1, kernel_size=3, padding=1)
 
@@ -74,23 +103,23 @@ class EpsilonNet(nn.Module):
         site_latent: [B, site_latent_dim]
         """
         x = x_t.transpose(1, 2) # [B, 1, L]
+        
+        # Encode Time and NWP
         t_embed = self.time_mlp(t) # [B, hidden_dim]
+        nwp_feat = self.nwp_encoder(nwp.transpose(1, 2)) # [B, hidden_dim, L]
         
-        # Broad cast time and site latent to match seq_len if we were doing per-step cond
-        # But here we use ResidualBlock1D's cond_proj which handles the global cond
-        # We'll concatenate global site_latent and global t_embed
-        global_cond = torch.cat([t_embed, site_latent], dim=-1) # [B, hidden_dim + site_latent_dim]
+        # Global Condition
+        global_cond = torch.cat([t_embed, site_latent], dim=-1) # [B, global_cond_dim]
         
-        # For NWP, we might want to feed it into the blocks as a sequence. 
-        # Simplified: Concatenate mean NWP to global cond, or use as feature map.
-        # Let's concatenate mean NWP for global context in this block structure.
-        nwp_mean = nwp.mean(dim=1) # [B, nwp_dim]
-        full_cond = torch.cat([global_cond, nwp_mean], dim=-1) # [B, ...]
+        # Fusion of Power features and NWP features
+        h = self.init_conv(x) # [B, hidden_dim, L]
+        h = torch.cat([h, nwp_feat], dim=1) # [B, 2*hidden_dim, L]
+        h = self.fusion(h) # [B, hidden_dim, L]
         
-        h = self.init_conv(x)
-        h = self.block1(h, full_cond)
-        h = self.block2(h, full_cond)
-        
+        # Pass through Residual Blocks
+        for block in self.blocks:
+            h = block(h, global_cond)
+            
         epsilon_theta = self.final_conv(h)
         return epsilon_theta.transpose(1, 2) # [B, L, 1]
 
@@ -156,10 +185,13 @@ class DiffusionGenerator(nn.Module):
     def sample(
         self, 
         nwp: torch.Tensor, 
-        site_latent: torch.Tensor
+        site_latent: torch.Tensor,
+        ghi_clearsky: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         Reverse Diffusion Process (Inference).
+        Args:
+            ghi_clearsky: [B, L, 1] Optional physical upper bound.
         """
         B, L, _ = nwp.shape
         device = nwp.device
@@ -185,6 +217,16 @@ class DiffusionGenerator(nn.Module):
                 
             # x_{t-1} = 1/sqrt(a_t) * (x_t - (1-a_t)/sqrt(1-a_bar_t) * eps_theta) + sigma_t * z
             x = (1 / torch.sqrt(a)) * (x - ((1 - a) / torch.sqrt(1 - a_bar)) * eps_theta) + torch.sqrt(beta) * noise
+            
+            # --- Physical Constraints Step-by-Step ---
+            # Power cannot be negative
+            x = torch.clamp(x, min=0.0)
+            
+            # Optional: Clip by clear-sky GHI if provided
+            if ghi_clearsky is not None:
+                # We assume power is scaled similarly to GHI
+                # If they are normalized, this still acts as a relative envelope
+                x = torch.min(x, ghi_clearsky)
             
         return x # Generated Power [B, L, 1]
 

@@ -4,28 +4,93 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, ConcatDataset
 from typing import Dict, List, Optional, Tuple
 
-class TimeSeriesTransformer(nn.Module):
+class GatedResidualNetwork(nn.Module):
     """
-    Lightweight Transformer-based Forecaster.
-    Predicts future power given past power and NWP (History + Future).
+    GRN from TFT: Provides non-linear processing and gating.
+    """
+    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int, dropout: float = 0.1):
+        super().__init__()
+        self.lin1 = nn.Linear(input_dim, hidden_dim)
+        self.lin2 = nn.Linear(hidden_dim, hidden_dim)
+        self.gate = nn.Linear(hidden_dim, output_dim)
+        self.norm = nn.LayerNorm(output_dim)
+        self.dropout = nn.Dropout(dropout)
+        
+        # Skip connection
+        self.skip = nn.Linear(input_dim, output_dim) if input_dim != output_dim else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = F.elu(self.lin1(x))
+        h = self.lin2(h)
+        # Gating: GLU-like behavior
+        g = torch.sigmoid(self.gate(h))
+        # Project skip
+        skip = self.skip(x)
+        return self.norm(skip + g * h)
+
+class VariableSelectionNetwork(nn.Module):
+    """
+    VSN from TFT: Learns the importance of each input variable.
+    """
+    def __init__(self, num_vars: int, d_model: int, dropout: float = 0.1):
+        super().__init__()
+        self.num_vars = num_vars
+        self.d_model = d_model
+        
+        # Encoders for each variable
+        self.var_encoders = nn.ModuleList([
+            GatedResidualNetwork(1, d_model, d_model, dropout) for _ in range(num_vars)
+        ])
+        
+        # Weights for each variable
+        self.weight_net = GatedResidualNetwork(num_vars * d_model, d_model, num_vars, dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, L, num_vars]
+        B, L, _ = x.shape
+        
+        # Encode each variable individually
+        var_outputs = []
+        for i in range(self.num_vars):
+            var_outputs.append(self.var_encoders[i](x[:, :, i:i+1]))
+        
+        # Stacked: [B, L, num_vars, d_model]
+        stacked = torch.stack(var_outputs, dim=2)
+        
+        # Compute selection weights
+        flat = stacked.view(B, L, -1)
+        weights = F.softmax(self.weight_net(flat), dim=-1) # [B, L, num_vars]
+        
+        # Weighted sum
+        out = torch.sum(weights.unsqueeze(-1) * stacked, dim=2) # [B, L, d_model]
+        return out
+
+class TemporalFusionForecaster(nn.Module):
+    """
+    Improved Forecaster inspired by Temporal Fusion Transformer (TFT).
+    Uses Variable Selection and Gated Residual Networks.
     """
     def __init__(
         self, 
         nwp_dim: int = 7, 
-        d_model: int = 64, 
-        nhead: int = 4, 
-        num_layers: int = 2,
+        d_model: int = 128, 
+        nhead: int = 8, 
+        num_layers: int = 3,
         dropout: float = 0.1
     ):
         super().__init__()
-        # Input projections
-        self.power_proj = nn.Linear(1, d_model)
-        self.nwp_proj = nn.Linear(nwp_dim, d_model)
+        self.d_model = d_model
         
-        # Positional Encoding (using learned embeddings for simplicity)
+        # 1. Variable Selection for NWP
+        self.nwp_vsn = VariableSelectionNetwork(nwp_dim, d_model, dropout)
+        
+        # 2. Encoder for Power
+        self.power_encoder = GatedResidualNetwork(1, d_model, d_model, dropout)
+        
+        # 3. Position Encoding
         self.pos_emb = nn.Parameter(torch.randn(1000, d_model)) 
         
-        # Transformer Encoder
+        # 4. Transformer Encoder
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model, 
             nhead=nhead, 
@@ -33,50 +98,43 @@ class TimeSeriesTransformer(nn.Module):
             dropout=dropout,
             batch_first=True
         )
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         
-        # Output head
-        self.output_layer = nn.Linear(d_model, 1)
+        # 5. Final Output Head
+        self.output_head = nn.Sequential(
+            GatedResidualNetwork(d_model, d_model, d_model, dropout),
+            nn.Linear(d_model, 1)
+        )
 
     def forward(self, past_power: torch.Tensor, nwp_seq: torch.Tensor) -> torch.Tensor:
         """
-        Args:
-            past_power: [B, history_len, 1]
-            nwp_seq: [B, total_len, nwp_dim]
-        Returns:
-            future_power_pred: [B, future_len, 1]
+        past_power: [B, history_len, 1]
+        nwp_seq: [B, total_len, nwp_dim]
         """
         B, total_len, _ = nwp_seq.shape
         history_len = past_power.shape[1]
-        future_len = total_len - history_len
         
-        # 1. Project and combine inputs
-        # Combine NWP features for the whole sequence
-        nwp_feat = self.nwp_proj(nwp_seq) # [B, total_len, d_model]
+        # NWP Variable Selection
+        nwp_feat = self.nwp_vsn(nwp_seq) # [B, total_len, d_model]
         
-        # Project past power and pad with zeros for future positions to keep same seq length
-        # Or more effectively, we only use history for encoder and attend to future NWP
-        # Let's use a simpler approach: encode full NWP + past power
-        past_power_feat = self.power_proj(past_power) # [B, history_len, d_model]
+        # Power Encoding
+        past_power_feat = self.power_encoder(past_power) # [B, history_len, d_model]
         
-        # Pad power features with 0s for the future part
-        future_power_feat = torch.zeros(B, future_len, d_model, device=past_power.device)
-        full_power_feat = torch.cat([past_power_feat, future_power_feat], dim=1) # [B, total_len, d_model]
+        # Combine: Future power is unknown, we only have NWP for future
+        # Use zeros for future power features
+        future_power_feat = torch.zeros(B, total_len - history_len, self.d_model, device=past_power.device)
+        full_power_feat = torch.cat([past_power_feat, future_power_feat], dim=1)
         
-        # Final combined embedding
+        # Fusion
         x = nwp_feat + full_power_feat + self.pos_emb[:total_len, :]
         
-        # 2. Transformer Encoding
-        # We use a causal mask so future target power doesn't leak (though it's 0 here)
-        # But more importantly, we want to predict future_len positions
+        # Transformer (with causal mask)
         mask = torch.triu(torch.ones(total_len, total_len), diagonal=1).bool().to(x.device)
+        feat = self.transformer(x, mask=mask)
         
-        feat = self.transformer_encoder(x, mask=mask)
-        
-        # 3. Project to Power
-        # We only care about the predictions for the future window
+        # Prediction for future
         future_feat = feat[:, history_len:, :]
-        preds = self.output_layer(future_feat)
+        preds = self.output_head(future_feat)
         
         return preds
 
@@ -146,7 +204,7 @@ if __name__ == "__main__":
     total = H + F
     nwp_dim = 7
     
-    model = TimeSeriesTransformer(nwp_dim=nwp_dim)
+    model = TemporalFusionForecaster(nwp_dim=nwp_dim)
     
     past_p = torch.randn(B, H, 1)
     nwp = torch.randn(B, total, nwp_dim)

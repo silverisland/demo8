@@ -109,6 +109,17 @@ class PVDataset(Dataset):
         # Physics Injection: Clear-sky GHI
         ghi_clearsky = self._compute_clearsky_ghi(start_time, meta['lat'], meta['lon'], meta['tz'])
         
+        # --- 2. Anomaly Filtering (from tast.md) ---
+        # "drop sequences where real_power == 0 but GHI > 500"
+        # We also check if daytime clear-sky is high enough but power is all zero
+        is_daytime = (ghi_clearsky > 100)
+        high_ghi = (ghi_clearsky > 500)
+        is_zero_power = (power == 0)
+        
+        # If more than 30% of daytime has zero power, it's likely faulty data or curtailment
+        if (is_zero_power & high_ghi).sum() > 0.1 * high_ghi.sum():
+            return self.__getitem__(np.random.randint(0, len(self)))
+
         # Time Features: [total_len, 4]
         time_feats = self._get_time_features(start_time, meta['tz'])
         
