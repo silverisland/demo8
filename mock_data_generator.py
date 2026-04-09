@@ -7,9 +7,8 @@ from config import config
 
 def generate_mock_dataloader(num_samples=100, batch_size=16):
     """
-    Generates a mock DataLoader with rugged PV power data for testing.
+    Generates a mock DataLoader with 1-day (96 steps) rugged PV power data.
     """
-    history_len = config.history_len
     future_len = config.future_len
     
     # 1. Create Mock DataFrame
@@ -21,43 +20,39 @@ def generate_mock_dataloader(num_samples=100, batch_size=16):
         # Start time (random date in 2023)
         start_time = pd.Timestamp('2023-01-01') + pd.Timedelta(days=np.random.randint(0, 300))
         
-        # GHI: Rough bell shape
+        # GHI: Rough bell shape for 1 day
         def get_ghi(length):
-            # Create a simple diurnal cycle over the length
-            # Note: length is total time steps (e.g. 672 for 7 days)
-            # Each day is 96 steps
             t = np.arange(length)
-            diurnal = np.maximum(0, np.sin(2 * np.pi * (t % 96 - 24) / 96))
+            # Center at midday (48 steps)
+            diurnal = np.maximum(0, np.sin(np.pi * (t - 24) / 48))
             ghi = 1000 * diurnal + np.random.normal(0, 50, length)
             return np.maximum(0, ghi)
 
-        ghi_hist = get_ghi(history_len)
         ghi_fut = get_ghi(future_len)
         
         # Power: Derived from GHI with "rugged" cloud effects
         def get_power(ghi):
             efficiency = 0.15 + np.random.normal(0, 0.02)
             power = efficiency * ghi
-            # Add "cloud drops": random sharp dips to simulate ruggedness
-            num_clouds = int(len(ghi) / 20)
+            # Cloud drops for 1 day (fewer clouds than 7 days)
+            num_clouds = int(len(ghi) / 10)
             for _ in range(num_clouds):
                 idx = np.random.randint(0, len(power))
-                width = np.random.randint(2, 8)
+                width = np.random.randint(2, 6)
                 power[idx:idx+width] *= np.random.uniform(0.1, 0.6)
-            # Add jitter
             power += np.random.normal(0, 2, len(power))
             return np.maximum(0, power)
         
-        power_hist = get_power(ghi_hist)
         power_fut = get_power(ghi_fut)
         
         dummy_data.append({
             'timestamp_win': start_time,
-            'observe_power': power_hist,
+            # Placeholder for history (not used)
+            'observe_power': np.zeros(0), 
             'observe_power_future': power_fut,
-            'GHI_solargis': ghi_hist,
+            'GHI_solargis': np.zeros(0),
             'GHI_solargis_future': ghi_fut,
-            'TEMP_solargis': np.random.normal(25, 5, history_len),
+            'TEMP_solargis': np.zeros(0),
             'TEMP_solargis_future': np.random.normal(25, 5, future_len),
             'station': station_id
         })

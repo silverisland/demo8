@@ -259,7 +259,7 @@ class DiffusionGenerator(nn.Module):
 if __name__ == "__main__":
     # Test Diffusion Generator
     batch_size = 4
-    seq_len = 192
+    seq_len = 96 # 1 day
     nwp_dim = 7
     site_latent_dim = 64
     
@@ -270,9 +270,9 @@ if __name__ == "__main__":
     real_power = torch.randn(batch_size, seq_len, 1)
     
     # Training loss
-    loss = model.compute_loss(real_power, nwp, site_latent)
-    print(f"Diffusion Training Loss: {loss.item()}")
+    loss_res = model.compute_loss(real_power, nwp, site_latent)
+    print(f"Diffusion Training Loss (MSE): {loss_res['l_mse'].item()}")
     
     # Inference sampling
     generated = model.sample(nwp, site_latent)
-    print(f"Generated Power Shape: {generated.shape}") # [4, 192, 1]
+    print(f"Generated Power Shape: {generated.shape}") # [4, 96, 1]

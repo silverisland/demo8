@@ -11,9 +11,9 @@ class ModelConfig:
     memory_input_dim: int = 8 
     
     # Sequences
-    history_len: int = 672 # 7 days
-    future_len: int = 192  # 2 days
-    total_len: int = 864   # 672 + 192
+    history_len: int = 0   # No longer used for generation
+    future_len: int = 96   # 1 day @ 15min
+    total_len: int = 96    # Matches future_len
     
     # Diffusion
     timesteps: int = 100
