@@ -151,9 +151,14 @@ def train_with_augmentation(
     """
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     criterion = nn.MSELoss()
-    
+
     device = next(model.parameters()).device
     model.train()
+
+    # Initialize synthetic iterator if loader is provided
+    synthetic_iter = None
+    if synthetic_loader is not None and synthetic_ratio > 0:
+        synthetic_iter = iter(synthetic_loader)
     
     for epoch in range(epochs):
         total_loss = 0
@@ -172,18 +177,24 @@ def train_with_augmentation(
             
             # 2. Synthetic Data Step (if provided)
             loss_syn = torch.tensor(0.0).to(device)
-            if synthetic_loader is not None:
+            if synthetic_loader is not None and synthetic_ratio > 0:
                 try:
-                    syn_batch = next(iter(synthetic_loader))
+                    syn_batch = next(synthetic_iter)
                 except StopIteration:
-                    # Refresh synthetic iterator if it's shorter/longer
-                    syn_batch = next(iter(synthetic_loader))
-                
-                nwp_s = syn_batch['nwp'].to(device)
-                power_s = syn_batch['power'].to(device)
-                
-                pred_s = model(power_s[:, :history_len, :], nwp_s)
-                loss_syn = criterion(pred_s, power_s[:, history_len:, :])
+                    # Refresh synthetic iterator when exhausted
+                    synthetic_iter = iter(synthetic_loader)
+                    try:
+                        syn_batch = next(synthetic_iter)
+                    except StopIteration:
+                        # synthetic_loader is empty, skip synthetic data
+                        syn_batch = None
+
+                if syn_batch is not None:
+                    nwp_s = syn_batch['nwp'].to(device)
+                    power_s = syn_batch['power'].to(device)
+
+                    pred_s = model(power_s[:, :history_len, :], nwp_s)
+                    loss_syn = criterion(pred_s, power_s[:, history_len:, :])
             
             # Weighted Loss
             loss = (1 - synthetic_ratio) * loss_real + synthetic_ratio * loss_syn

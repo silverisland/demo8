@@ -21,12 +21,31 @@ class TimeStepEmbedding(nn.Module):
         embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
         return embeddings
 
+class FiLMBlock(nn.Module):
+    """
+    Feature-wise Linear Modulation (FiLM).
+    Conditions (NWP + Site Latent) scale and shift the internal features.
+    """
+    def __init__(self, cond_dim: int, out_channels: int):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(cond_dim, out_channels),
+            nn.SiLU(),
+            nn.Linear(out_channels, out_channels * 2),
+        )
+
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        # x: [B, C, L], cond: [B, cond_dim]
+        style = self.mlp(cond).unsqueeze(-1) # [B, 2*C, 1]
+        gamma, beta = style.chunk(2, dim=1)
+        return x * (1 + gamma) + beta
+
 class ResidualBlock1D(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, cond_dim: int):
         super().__init__()
         self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size=3, padding=1)
         self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size=3, padding=1)
-        self.cond_proj = nn.Linear(cond_dim, out_channels)
+        self.film = FiLMBlock(cond_dim, out_channels)
         self.norm1 = nn.GroupNorm(8, out_channels)
         self.norm2 = nn.GroupNorm(8, out_channels)
         self.shortcut = nn.Conv1d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
@@ -36,10 +55,17 @@ class ResidualBlock1D(nn.Module):
         x: [B, C, L]
         cond: [B, cond_dim]
         """
-        h = F.relu(self.norm1(self.conv1(x)))
-        # Add condition (time + site latent)
-        h = h + self.cond_proj(cond).unsqueeze(-1)
-        h = F.relu(self.norm2(self.conv2(h)))
+        h = self.conv1(x)
+        h = self.norm1(h)
+        h = F.silu(h)
+        
+        # FiLM modulation instead of simple addition
+        h = self.film(h, cond)
+        
+        h = self.conv2(h)
+        h = self.norm2(h)
+        h = F.silu(h)
+        
         return h + self.shortcut(x)
 
 class NWPEncoder(nn.Module):

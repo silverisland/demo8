@@ -25,6 +25,7 @@ class ModelConfig:
     
     # Physics (CPT Loss)
     alpha_physics: float = 10.0
-    beta_smoothness: float = 1.0
+    gamma_fluctuation: float = 0.5  # Match ruggedness/fluctuation
+    delta_monotonicity: float = 0.1 # Trend consistency (CLT-inspired)
 
 config = ModelConfig()

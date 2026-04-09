@@ -32,7 +32,8 @@ def train_stage1(
     
     criterion = ConsistentPowerTransportLoss(
         alpha=config.alpha_physics, 
-        beta=config.beta_smoothness
+        gamma=config.gamma_fluctuation,
+        delta=config.delta_monotonicity
     )
     
     optimizer = torch.optim.Adam(
@@ -48,7 +49,9 @@ def train_stage1(
     
     for epoch in range(epochs):
         epoch_loss = 0
-        epoch_physics_loss = 0
+        epoch_physics_bound = 0
+        epoch_fluctuation = 0
+        epoch_monotonicity = 0
         
         for batch in train_loader:
             nwp = batch['nwp'].to(device)             # [B, total_len, 7]
@@ -58,12 +61,10 @@ def train_stage1(
             
             # --- Identity Adaptation (Mock context window) ---
             # In source pre-training, we use the whole sequence to extract identity 
-            # Or use site_id clusters directly
             context_data = torch.cat([nwp, power], dim=-1) # [B, total_len, 8]
             site_latent = memory_bank(context_data=context_data)
             
             # --- Diffusion Training (with Physics Constraint) ---
-            # Forward + x0 reconstruction
             res = generator.compute_loss(power, nwp, site_latent)
             
             # CPT Loss on the reconstructed p_generated (x0)
@@ -81,13 +82,26 @@ def train_stage1(
             optimizer.step()
             
             epoch_loss += res['l_mse'].item()
-            epoch_physics_loss += cpt_results['l_physics_bound'].item()
+            epoch_physics_bound += cpt_results['l_physics_bound'].item()
+            epoch_fluctuation += cpt_results['l_fluctuation'].item()
+            epoch_monotonicity += cpt_results['l_monotonicity'].item()
             
-        print(f"Epoch {epoch+1}/{epochs} | Noise MSE: {epoch_loss/len(train_loader):.6f} | Physics Violation: {epoch_physics_loss/len(train_loader):.6f}")
+        print(f"Epoch {epoch+1}/{epochs} | Noise MSE: {epoch_loss/len(train_loader):.6f} | "
+              f"Phys: {epoch_physics_bound/len(train_loader):.4f} | "
+              f"Fluc: {epoch_fluctuation/len(train_loader):.4f} | "
+              f"Trend: {epoch_monotonicity/len(train_loader):.4f}")
 
 if __name__ == "__main__":
-    # Test with dummy DataLoader
+    from mock_data_generator import generate_mock_dataloader
+    
+    # Set device
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    # Placeholder for actual DataLoader implementation
-    # from dataset import PVDataset...
-    print("Stage 1 script verified.")
+    if torch.backends.mps.is_available():
+        device = "mps"
+        
+    # 1. Create Mock DataLoader
+    print("Generating mock data...")
+    train_loader = generate_mock_dataloader(num_samples=200, batch_size=32)
+    
+    # 2. Run Stage 1 Pre-training (short run for testing)
+    train_stage1(train_loader, epochs=10, lr=1e-4, device=device)

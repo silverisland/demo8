@@ -86,39 +86,49 @@ class PVDataset(Dataset):
         return len(self.df)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        row = self.df.iloc[idx]
-        station_id = row['station']
-        meta = self.station_metadata[station_id]
-        
-        # Parse timestamp (assuming it's the start of future)
-        start_time = pd.to_datetime(row['timestamp_win'])
-        if start_time.tzinfo is None:
-            start_time = start_time.tz_localize('UTC').tz_convert(meta['tz'])
-        else:
-            start_time = start_time.tz_convert(meta['tz'])
+        # Use iterative retry instead of recursion to avoid stack overflow
+        max_retries = 10
 
-        # Concatenate history and future for NWP and Power
-        # Power [total_len, 1]
-        power = np.concatenate([row['observe_power'], row['observe_power_future']])
-        
-        # NWP features: [total_len, 2] (GHI, TEMP)
-        nwp_ghi = np.concatenate([row['GHI_solargis'], row['GHI_solargis_future']])
-        nwp_temp = np.concatenate([row['TEMP_solargis'], row['TEMP_solargis_future']])
-        nwp_base = np.stack([nwp_ghi, nwp_temp], axis=-1)
-        
-        # Physics Injection: Clear-sky GHI
-        ghi_clearsky = self._compute_clearsky_ghi(start_time, meta['lat'], meta['lon'], meta['tz'])
-        
-        # --- 2. Anomaly Filtering (from tast.md) ---
-        # "drop sequences where real_power == 0 but GHI > 500"
-        # We also check if daytime clear-sky is high enough but power is all zero
-        is_daytime = (ghi_clearsky > 100)
-        high_ghi = (ghi_clearsky > 500)
-        is_zero_power = (power == 0)
-        
-        # If more than 30% of daytime has zero power, it's likely faulty data or curtailment
-        if (is_zero_power & high_ghi).sum() > 0.1 * high_ghi.sum():
-            return self.__getitem__(np.random.randint(0, len(self)))
+        for _ in range(max_retries):
+            row = self.df.iloc[idx]
+            station_id = row['station']
+            meta = self.station_metadata[station_id]
+
+            # Parse timestamp (assuming it's the start of future)
+            start_time = pd.to_datetime(row['timestamp_win'])
+            if start_time.tzinfo is None:
+                start_time = start_time.tz_localize('UTC').tz_convert(meta['tz'])
+            else:
+                start_time = start_time.tz_convert(meta['tz'])
+
+            # Concatenate history and future for NWP and Power
+            # Power [total_len, 1]
+            power = np.concatenate([row['observe_power'], row['observe_power_future']])
+
+            # NWP features: [total_len, 2] (GHI, TEMP)
+            nwp_ghi = np.concatenate([row['GHI_solargis'], row['GHI_solargis_future']])
+            nwp_temp = np.concatenate([row['TEMP_solargis'], row['TEMP_solargis_future']])
+            nwp_base = np.stack([nwp_ghi, nwp_temp], axis=-1)
+
+            # Physics Injection: Clear-sky GHI
+            ghi_clearsky = self._compute_clearsky_ghi(start_time, meta['lat'], meta['lon'], meta['tz'])
+
+            # --- Anomaly Filtering (from tast.md) ---
+            # "drop sequences where real_power == 0 but GHI > 500"
+            high_ghi = (ghi_clearsky > 500)
+            is_zero_power = (power == 0)
+
+            # If more than 10% of high-GHI periods have zero power, it's likely faulty data
+            if high_ghi.sum() > 0 and (is_zero_power & high_ghi).sum() > 0.1 * high_ghi.sum():
+                # Try a different sample
+                idx = np.random.randint(0, len(self))
+                continue
+
+            # Valid sample found
+            break
+        else:
+            # If all retries failed, return the last sample (best effort)
+            pass
 
         # Time Features: [total_len, 4]
         time_feats = self._get_time_features(start_time, meta['tz'])
