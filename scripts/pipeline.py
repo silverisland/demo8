@@ -3,8 +3,8 @@ import torch.nn as nn
 import numpy as np
 import pandas as pd
 from typing import Dict, List, Optional, Any
-from memory import SiteMemoryBank
-from generator import DiffusionGenerator
+from src.utils.memory import SiteMemoryBank
+from src.models.generator import DiffusionGenerator
 
 class PVGenerationPipeline:
     """

@@ -2,8 +2,8 @@ import pandas as pd
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
-from dataset import PVDataset
-from config import config
+from .dataset import PVDataset
+from ..utils.config import config
 
 def generate_mock_dataloader(num_samples=100, batch_size=16):
     """
