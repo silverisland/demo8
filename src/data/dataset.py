@@ -41,6 +41,46 @@ def compute_clearsky_series(
     
     return np.array(clearsky_ghi_all)
 
+def compute_time_features_series(
+    df: pd.DataFrame, 
+    station_metadata: Dict[Any, Dict[str, float]], 
+    future_len: int = 192
+) -> np.ndarray:
+    """
+    Standalone interface to compute time features (Sin/Cos) for a dataset.
+    """
+    time_feats_all = []
+    for idx in range(len(df)):
+        row = df.iloc[idx]
+        station_id = row['station']
+        meta = station_metadata[station_id]
+        
+        # Parse and localize timestamp
+        start_time = pd.to_datetime(row['timestamp_win'])
+        if start_time.tzinfo is None:
+            start_time = start_time.tz_localize('UTC').tz_convert(meta['tz'])
+        else:
+            start_time = start_time.tz_convert(meta['tz'])
+            
+        times = pd.date_range(
+            start=start_time, 
+            periods=future_len, 
+            freq='15min', 
+            tz=meta['tz']
+        )
+        
+        hours = times.hour + times.minute / 60.0
+        months = times.month - 1 # 0-11
+        
+        hour_sin = np.sin(2 * np.pi * hours / 24.0)
+        hour_cos = np.cos(2 * np.pi * hours / 24.0)
+        month_sin = np.sin(2 * np.pi * months / 12.0)
+        month_cos = np.cos(2 * np.pi * months / 12.0)
+        
+        time_feats_all.append(np.stack([hour_sin, hour_cos, month_sin, month_cos], axis=-1).astype(np.float32))
+    
+    return np.array(time_feats_all)
+
 class PVDataset(Dataset):
     """
     Physics-Informed Dataset for Multi-site PV Generation.
@@ -52,6 +92,7 @@ class PVDataset(Dataset):
     - TEMP_solargis_future: np.ndarray [future_len] (Future NWP Temperature)
     - station: Station ID
     - ghi_clearsky: Optional[np.ndarray] [future_len] (Pre-computed clear-sky GHI)
+    - time_features: Optional[np.ndarray] [future_len, 4] (Pre-computed time features)
     """
     
     def __init__(
@@ -82,44 +123,13 @@ class PVDataset(Dataset):
             print(f"Pre-computing clearsky GHI for {len(df)} samples...")
             self.clearsky_ghi_all = compute_clearsky_series(df, station_metadata, future_len)
         
-        # 2. Pre-compute time features
-        print(f"Pre-computing time features for {len(df)} samples...")
-        self.time_feats_all = []
-        for idx in range(len(self.df)):
-            row = self.df.iloc[idx]
-            station_id = row['station']
-            meta = self.station_metadata[station_id]
-            start_time = pd.to_datetime(row['timestamp_win'])
-            if start_time.tzinfo is None:
-                start_time = start_time.tz_localize('UTC').tz_convert(meta['tz'])
-            else:
-                start_time = start_time.tz_convert(meta['tz'])
-            
-            time_f = self._get_time_features(start_time, meta['tz'])
-            self.time_feats_all.append(time_f)
-            
-        self.time_feats_all = np.array(self.time_feats_all)
-
-    def _get_time_features(self, start_time: pd.Timestamp, tz: str) -> np.ndarray:
-        """
-        Compute Sin/Cos positional encoding for hour-of-day and month-of-year.
-        """
-        times = pd.date_range(
-            start=start_time, 
-            periods=self.future_len, 
-            freq='15min', 
-            tz=tz
-        )
-        
-        hours = times.hour + times.minute / 60.0
-        months = times.month - 1 # 0-11
-        
-        hour_sin = np.sin(2 * np.pi * hours / 24.0)
-        hour_cos = np.cos(2 * np.pi * hours / 24.0)
-        month_sin = np.sin(2 * np.pi * months / 12.0)
-        month_cos = np.cos(2 * np.pi * months / 12.0)
-        
-        return np.stack([hour_sin, hour_cos, month_sin, month_cos], axis=-1).astype(np.float32) # [future_len, 4]
+        # 2. Handle Time Features (Check if pre-computed in DF)
+        if 'time_features' in self.df.columns:
+            print("Using pre-computed time features from DataFrame.")
+            self.time_feats_all = np.stack(self.df['time_features'].values)
+        else:
+            print(f"Pre-computing time features for {len(df)} samples...")
+            self.time_feats_all = compute_time_features_series(df, station_metadata, future_len)
 
     def __len__(self) -> int:
         return len(self.df)
