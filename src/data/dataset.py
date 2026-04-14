@@ -7,19 +7,51 @@ import pvlib
 from pvlib.location import Location
 from datetime import datetime, timedelta
 
+def compute_clearsky_series(
+    df: pd.DataFrame, 
+    station_metadata: Dict[Any, Dict[str, float]], 
+    future_len: int = 192
+) -> np.ndarray:
+    """
+    Standalone interface to compute clearsky GHI for a dataset.
+    Can be used for pre-processing.
+    """
+    clearsky_ghi_all = []
+    for idx in range(len(df)):
+        row = df.iloc[idx]
+        station_id = row['station']
+        meta = station_metadata[station_id]
+        
+        # Parse and localize timestamp
+        start_time = pd.to_datetime(row['timestamp_win'])
+        if start_time.tzinfo is None:
+            start_time = start_time.tz_localize('UTC').tz_convert(meta['tz'])
+        else:
+            start_time = start_time.tz_convert(meta['tz'])
+            
+        loc = Location(meta['lat'], meta['lon'], tz=meta['tz'])
+        times = pd.date_range(
+            start=start_time, 
+            periods=future_len, 
+            freq='15min', 
+            tz=meta['tz']
+        )
+        clearsky = loc.get_clearsky(times)
+        clearsky_ghi_all.append(clearsky['ghi'].values.astype(np.float32))
+    
+    return np.array(clearsky_ghi_all)
+
 class PVDataset(Dataset):
     """
     Physics-Informed Dataset for Multi-site PV Generation.
     
     Data Structure expected in input DataFrame:
     - timestamp_win: Base timestamp for each sequence (15min resolution).
-    - observe_power: np.ndarray [672] (History 7 days)
-    - observe_power_future: np.ndarray [192] (Future 2 days)
-    - GHI_solargis: np.ndarray [672] (History 7 days NWP GHI)
-    - GHI_solargis_future: np.ndarray [192] (Future 2 days NWP GHI)
-    - TEMP_solargis: np.ndarray [672] (History 7 days NWP Temperature)
-    - TEMP_solargis_future: np.ndarray [192] (Future 2 days NWP Temperature)
+    - observe_power_future: np.ndarray [future_len] (Future power)
+    - GHI_solargis_future: np.ndarray [future_len] (Future NWP GHI)
+    - TEMP_solargis_future: np.ndarray [future_len] (Future NWP Temperature)
     - station: Station ID
+    - ghi_clearsky: Optional[np.ndarray] [future_len] (Pre-computed clear-sky GHI)
     """
     
     def __init__(
@@ -42,47 +74,31 @@ class PVDataset(Dataset):
         self.future_len = future_len
         self.total_len = history_len + future_len
         
-        # Pre-compute clearsky GHI and time features for all rows
-        print(f"Pre-computing clearsky GHI and time features for {len(df)} samples...")
-        self.clearsky_ghi_all = []
-        self.time_feats_all = []
+        # 1. Handle Clearsky GHI (Check if pre-computed in DF)
+        if 'ghi_clearsky' in self.df.columns:
+            print("Using pre-computed clearsky GHI from DataFrame.")
+            self.clearsky_ghi_all = np.stack(self.df['ghi_clearsky'].values)
+        else:
+            print(f"Pre-computing clearsky GHI for {len(df)} samples...")
+            self.clearsky_ghi_all = compute_clearsky_series(df, station_metadata, future_len)
         
+        # 2. Pre-compute time features
+        print(f"Pre-computing time features for {len(df)} samples...")
+        self.time_feats_all = []
         for idx in range(len(self.df)):
             row = self.df.iloc[idx]
             station_id = row['station']
             meta = self.station_metadata[station_id]
-            
-            # Parse and localize timestamp
             start_time = pd.to_datetime(row['timestamp_win'])
             if start_time.tzinfo is None:
                 start_time = start_time.tz_localize('UTC').tz_convert(meta['tz'])
             else:
                 start_time = start_time.tz_convert(meta['tz'])
-                
-            # Compute features
-            ghi_cs = self._compute_clearsky_ghi(start_time, meta['lat'], meta['lon'], meta['tz'])
-            time_f = self._get_time_features(start_time, meta['tz'])
             
-            self.clearsky_ghi_all.append(ghi_cs)
+            time_f = self._get_time_features(start_time, meta['tz'])
             self.time_feats_all.append(time_f)
             
-        self.clearsky_ghi_all = np.array(self.clearsky_ghi_all)
         self.time_feats_all = np.array(self.time_feats_all)
-
-    def _compute_clearsky_ghi(self, start_time: pd.Timestamp, lat: float, lon: float, tz: str) -> np.ndarray:
-        """
-        Compute clearsky GHI for the target sequence.
-        """
-        loc = Location(lat, lon, tz=tz)
-        times = pd.date_range(
-            start=start_time, 
-            periods=self.future_len, 
-            freq='15min', 
-            tz=tz
-        )
-        # Use Ineichen model for clearsky
-        clearsky = loc.get_clearsky(times)
-        return clearsky['ghi'].values.astype(np.float32) # [future_len]
 
     def _get_time_features(self, start_time: pd.Timestamp, tz: str) -> np.ndarray:
         """
