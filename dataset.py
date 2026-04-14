@@ -41,10 +41,37 @@ class PVDataset(Dataset):
         self.history_len = history_len
         self.future_len = future_len
         self.total_len = history_len + future_len
+        
+        # Pre-compute clearsky GHI and time features for all rows
+        print(f"Pre-computing clearsky GHI and time features for {len(df)} samples...")
+        self.clearsky_ghi_all = []
+        self.time_feats_all = []
+        
+        for idx in range(len(self.df)):
+            row = self.df.iloc[idx]
+            station_id = row['station']
+            meta = self.station_metadata[station_id]
+            
+            # Parse and localize timestamp
+            start_time = pd.to_datetime(row['timestamp_win'])
+            if start_time.tzinfo is None:
+                start_time = start_time.tz_localize('UTC').tz_convert(meta['tz'])
+            else:
+                start_time = start_time.tz_convert(meta['tz'])
+                
+            # Compute features
+            ghi_cs = self._compute_clearsky_ghi(start_time, meta['lat'], meta['lon'], meta['tz'])
+            time_f = self._get_time_features(start_time, meta['tz'])
+            
+            self.clearsky_ghi_all.append(ghi_cs)
+            self.time_feats_all.append(time_f)
+            
+        self.clearsky_ghi_all = np.array(self.clearsky_ghi_all)
+        self.time_feats_all = np.array(self.time_feats_all)
 
     def _compute_clearsky_ghi(self, start_time: pd.Timestamp, lat: float, lon: float, tz: str) -> np.ndarray:
         """
-        Compute clearsky GHI for the target 1-day sequence.
+        Compute clearsky GHI for the target sequence.
         """
         loc = Location(lat, lon, tz=tz)
         times = pd.date_range(
@@ -55,7 +82,7 @@ class PVDataset(Dataset):
         )
         # Use Ineichen model for clearsky
         clearsky = loc.get_clearsky(times)
-        return clearsky['ghi'].values # [future_len]
+        return clearsky['ghi'].values.astype(np.float32) # [future_len]
 
     def _get_time_features(self, start_time: pd.Timestamp, tz: str) -> np.ndarray:
         """
@@ -76,7 +103,7 @@ class PVDataset(Dataset):
         month_sin = np.sin(2 * np.pi * months / 12.0)
         month_cos = np.cos(2 * np.pi * months / 12.0)
         
-        return np.stack([hour_sin, hour_cos, month_sin, month_cos], axis=-1) # [future_len, 4]
+        return np.stack([hour_sin, hour_cos, month_sin, month_cos], axis=-1).astype(np.float32) # [future_len, 4]
 
     def __len__(self) -> int:
         return len(self.df)
@@ -88,26 +115,18 @@ class PVDataset(Dataset):
         for _ in range(max_retries):
             row = self.df.iloc[idx]
             station_id = row['station']
-            meta = self.station_metadata[station_id]
+            
+            # Use pre-computed clearsky GHI and time features
+            ghi_clearsky = self.clearsky_ghi_all[idx]
+            time_feats = self.time_feats_all[idx]
 
-            # Parse timestamp (the start of future window)
-            start_time = pd.to_datetime(row['timestamp_win'])
-            if start_time.tzinfo is None:
-                start_time = start_time.tz_localize('UTC').tz_convert(meta['tz'])
-            else:
-                start_time = start_time.tz_convert(meta['tz'])
-
-            # Only use the first 96 steps (1 day) of the future data
-            # Power [future_len, 1]
+            # Only use the first future_len steps of the future data
             power = row['observe_power_future'][:self.future_len]
 
             # NWP features: [future_len, 2] (GHI, TEMP)
             nwp_ghi = row['GHI_solargis_future'][:self.future_len]
             nwp_temp = row['TEMP_solargis_future'][:self.future_len]
             nwp_base = np.stack([nwp_ghi, nwp_temp], axis=-1)
-
-            # Physics Injection: Clear-sky GHI for 1 day
-            ghi_clearsky = self._compute_clearsky_ghi(start_time, meta['lat'], meta['lon'], meta['tz'])
 
             # --- Anomaly Filtering ---
             high_ghi = (ghi_clearsky > 500)
@@ -119,17 +138,13 @@ class PVDataset(Dataset):
 
             break
         
-        # Time Features: [future_len, 4]
-        time_feats = self._get_time_features(start_time, meta['tz'])
-        
         # Final NWP feature tensor: Base NWP + Clear-sky GHI + Time Features
-        # [96, 2 + 1 + 4] = [96, 7]
         nwp_full = np.concatenate([nwp_base, ghi_clearsky[:, np.newaxis], time_feats], axis=-1)
         
         return {
-            'nwp': torch.tensor(nwp_full, dtype=torch.float32),      # [96, 7]
-            'ghi_clearsky': torch.tensor(ghi_clearsky, dtype=torch.float32).unsqueeze(-1), # [96, 1]
-            'power': torch.tensor(power, dtype=torch.float32).unsqueeze(-1), # [96, 1]
+            'nwp': torch.tensor(nwp_full, dtype=torch.float32),
+            'ghi_clearsky': torch.tensor(ghi_clearsky, dtype=torch.float32).unsqueeze(-1),
+            'power': torch.tensor(power, dtype=torch.float32).unsqueeze(-1),
             'site_id': torch.tensor(int(station_id), dtype=torch.long)
         }
 
