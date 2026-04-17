@@ -212,12 +212,17 @@ class DiffusionGenerator(nn.Module):
         self, 
         nwp: torch.Tensor, 
         site_latent: torch.Tensor,
-        ghi_clearsky: Optional[torch.Tensor] = None
+        ghi_clearsky: Optional[torch.Tensor] = None,
+        noise_scale: float = 1.0,
+        custom_steps: Optional[int] = None
     ) -> torch.Tensor:
         """
         Reverse Diffusion Process (Inference).
         Args:
             ghi_clearsky: [B, L, 1] Optional physical upper bound.
+            noise_scale: Control the ruggedness/fluctuation strength (Cloud intensity). 
+                         >1.0 for more clouds/ruggedness, <1.0 for smoother.
+            custom_steps: If provided, use a different number of steps for sampling.
         """
         B, L, _ = nwp.shape
         device = nwp.device
@@ -225,7 +230,13 @@ class DiffusionGenerator(nn.Module):
         # Start from pure noise
         x = torch.randn(B, L, 1, device=device)
         
-        for i in reversed(range(self.timesteps)):
+        # Determine sampling schedule
+        if custom_steps is not None and custom_steps < self.timesteps:
+            step_indices = np.linspace(0, self.timesteps - 1, custom_steps).astype(int)
+        else:
+            step_indices = np.arange(self.timesteps)
+            
+        for i in reversed(step_indices):
             t = torch.full((B,), i, device=device, dtype=torch.long)
             
             # Predict noise
@@ -237,7 +248,8 @@ class DiffusionGenerator(nn.Module):
             beta = self.beta[i]
             
             if i > 0:
-                noise = torch.randn_like(x)
+                # noise_scale > 1.0 will simulate more intense cloud passing/ruggedness
+                noise = torch.randn_like(x) * noise_scale
             else:
                 noise = 0
                 
@@ -250,9 +262,7 @@ class DiffusionGenerator(nn.Module):
             
             # Optional: Clip by clear-sky GHI if provided
             if ghi_clearsky is not None:
-                # We assume power is scaled similarly to GHI
-                # If they are normalized, this still acts as a relative envelope
-                x = torch.min(x, ghi_clearsky)
+                x = torch.min(x, ghi_clearsky.to(device))
             
         return x # Generated Power [B, L, 1]
 

@@ -38,7 +38,9 @@ class PVGenerationPipeline:
         self, 
         site_latent: torch.Tensor, 
         nwp_seq: torch.Tensor, 
-        ghi_clearsky: torch.Tensor
+        ghi_clearsky: torch.Tensor,
+        noise_scale: float = 1.0,
+        custom_steps: Optional[int] = None
     ) -> torch.Tensor:
         """
         Generates synthetic power for a specific period.
@@ -47,6 +49,8 @@ class PVGenerationPipeline:
             site_latent: [batch_size, latent_dim]
             nwp_seq: [batch_size, seq_len, nwp_dim]
             ghi_clearsky: [batch_size, seq_len, 1] (Physical anchor)
+            noise_scale: Controls ruggedness (Cloud strength)
+            custom_steps: Custom sampling steps
         """
         self.generator.eval()
         with torch.no_grad():
@@ -54,7 +58,9 @@ class PVGenerationPipeline:
             p_gen = self.generator.sample(
                 nwp=nwp_seq.to(self.device), 
                 site_latent=site_latent.to(self.device),
-                ghi_clearsky=ghi_clearsky.to(self.device)
+                ghi_clearsky=ghi_clearsky.to(self.device),
+                noise_scale=noise_scale,
+                custom_steps=custom_steps
             )
             
             # --- Physical Bounding (Hard Constraint Safety Layer) ---
@@ -70,34 +76,29 @@ class PVGenerationPipeline:
         site_latent: torch.Tensor, 
         full_year_nwp: torch.Tensor,
         full_year_ghi_cs: torch.Tensor,
-        chunk_size: int = 192
+        chunk_size: int = 192,
+        noise_scale: float = 1.0,
+        custom_steps: Optional[int] = None
     ) -> torch.Tensor:
         """
         Generates 12 months of synthetic data by processing in temporal chunks.
-        
-        Args:
-            site_latent: [batch_size, latent_dim]
-            full_year_nwp: [batch_size, total_steps, nwp_dim]
-            full_year_ghi_cs: [batch_size, total_steps, 1]
         """
         total_steps = full_year_nwp.shape[1]
         all_generated = []
         
-        # Site latent is shared across all chunks for this site
         for i in range(0, total_steps, chunk_size):
             end_idx = min(i + chunk_size, total_steps)
             
             nwp_chunk = full_year_nwp[:, i:end_idx, :]
             ghi_chunk = full_year_ghi_cs[:, i:end_idx, :]
-            
-            # Handle potential padding if last chunk is too small for model
-            curr_chunk_len = nwp_chunk.shape[1]
-            if curr_chunk_len < chunk_size:
-                # Padding logic if required by architecture (our 1D ResNet might be flexible)
-                # For this demo, we assume the ResNet can handle variable lengths or we pad.
-                pass 
                 
-            p_chunk = self.generate_synthetic_data(site_latent, nwp_chunk, ghi_chunk)
+            p_chunk = self.generate_synthetic_data(
+                site_latent, 
+                nwp_chunk, 
+                ghi_chunk,
+                noise_scale=noise_scale,
+                custom_steps=custom_steps
+            )
             all_generated.append(p_chunk)
             
         return torch.cat(all_generated, dim=1)
