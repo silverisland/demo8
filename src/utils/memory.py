@@ -38,44 +38,51 @@ class SiteMemoryBank(nn.Module):
         # Multi-head attention or simple scaled dot-product attention
         self.scale = latent_dim ** -0.5
 
-    def extract_fingerprint(self, context_data: torch.Tensor) -> torch.Tensor:
+    def get_query(self, context_data: torch.Tensor) -> torch.Tensor:
         """
-        Extracts the site latent vector from a context window (e.g., 1 month of data).
+        Step 1: Encode context sequence into a raw query vector.
         Args:
             context_data: [batch_size, seq_len, input_dim]
         Returns:
-            site_latent: [batch_size, latent_dim]
+            query: [batch_size, latent_dim]
         """
-        # 1. Encode context sequence
-        # We don't need the whole sequence output, just the final/aggregated state
         _, h_n = self.encoder(context_data) # h_n: [2, batch_size, hidden_dim]
-        
-        # Concatenate bidirectional hidden states
         query = torch.cat([h_n[0], h_n[1]], dim=-1) # [batch_size, hidden_dim * 2]
-        query = self.query_proj(query) # [batch_size, latent_dim]
-        
-        # 2. Attention over Codebook
-        # Query: [batch_size, latent_dim]
-        # Codebook (Keys/Values): [num_clusters, latent_dim]
-        
-        # Compute attention weights: [batch_size, num_clusters]
+        return self.query_proj(query)
+
+    def match_codebook(self, query: torch.Tensor) -> torch.Tensor:
+        """
+        Step 2: Map query vector to codebook space via attention.
+        Args:
+            query: [N, latent_dim] (N can be batch size or 1)
+        Returns:
+            site_latent: [N, latent_dim]
+        """
         attn_scores = torch.matmul(query, self.codebook.t()) * self.scale
         attn_weights = F.softmax(attn_scores, dim=-1)
-        
-        # Weighted sum of codebook entries: [batch_size, latent_dim]
         site_latent = torch.matmul(attn_weights, self.codebook)
-        
         return site_latent
 
-    def forward(self, context_data: Optional[torch.Tensor] = None, site_id: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def extract_fingerprint(self, context_data: torch.Tensor, aggregate: bool = False) -> torch.Tensor:
+        """
+        Extracts the site latent vector. 
+        If aggregate is True, it means all samples in context_data belong to the SAME site (Inference mode).
+        """
+        query = self.get_query(context_data)
+        
+        if aggregate:
+            # Mean aggregation across the temporal/batch samples for a single site
+            query = query.mean(dim=0, keepdim=True)
+            
+        return self.match_codebook(query)
+
+    def forward(self, context_data: Optional[torch.Tensor] = None, site_id: Optional[torch.Tensor] = None, aggregate: bool = False) -> torch.Tensor:
         """
         Forward pass for pre-training or few-shot inference.
         """
         if context_data is not None:
-            return self.extract_fingerprint(context_data)
+            return self.extract_fingerprint(context_data, aggregate=aggregate)
         elif site_id is not None:
-            # Direct lookup if we know the site cluster (useful for pre-training experiments)
-            # In actual few-shot, we always use context_data
             return self.codebook[site_id % self.num_clusters]
         else:
             raise ValueError("Either context_data or site_id must be provided")

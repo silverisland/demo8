@@ -40,27 +40,49 @@ class FiLMBlock(nn.Module):
         gamma, beta = style.chunk(2, dim=1)
         return x * (1 + gamma) + beta
 
+class CrossAttentionBlock(nn.Module):
+    """
+    Cross-Attention Fusion Module.
+    Backbone features (Query) attend to dynamic NWP features and static Site Latent (Key/Value).
+    """
+    def __init__(self, d_model: int, n_heads: int = 4):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=n_heads, batch_first=True)
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        """
+        x: [B, L, d_model] - Backbone features (Query)
+        context: [B, L_ctx, d_model] - Combined NWP and Site Fingerprint (Key/Value)
+        """
+        # x is [B, L, C], MultiheadAttention expects [B, L, C] if batch_first=True
+        attn_out, _ = self.attn(query=x, key=context, value=context)
+        return self.norm(x + attn_out)
+
 class ResidualBlock1D(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, cond_dim: int):
+    def __init__(self, in_channels: int, out_channels: int, time_cond_dim: int):
         super().__init__()
         self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size=3, padding=1)
         self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size=3, padding=1)
-        self.film = FiLMBlock(cond_dim, out_channels)
+        
+        # Keep FiLM for time-step conditioning only
+        self.time_film = FiLMBlock(time_cond_dim, out_channels)
+        
         self.norm1 = nn.GroupNorm(8, out_channels)
         self.norm2 = nn.GroupNorm(8, out_channels)
         self.shortcut = nn.Conv1d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
 
-    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
         """
         x: [B, C, L]
-        cond: [B, cond_dim]
+        t_emb: [B, time_cond_dim]
         """
         h = self.conv1(x)
         h = self.norm1(h)
         h = F.silu(h)
         
-        # FiLM modulation instead of simple addition
-        h = self.film(h, cond)
+        # Apply time-step modulation
+        h = self.time_film(h, t_emb)
         
         h = self.conv2(h)
         h = self.norm2(h)
@@ -68,26 +90,11 @@ class ResidualBlock1D(nn.Module):
         
         return h + self.shortcut(x)
 
-class NWPEncoder(nn.Module):
-    """
-    Encodes the NWP sequence into a feature map.
-    """
-    def __init__(self, nwp_dim: int, hidden_dim: int):
-        super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv1d(nwp_dim, hidden_dim, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1)
-        )
-
-    def forward(self, nwp: torch.Tensor) -> torch.Tensor:
-        # nwp: [B, C, L]
-        return self.conv(nwp)
-
 class EpsilonNet(nn.Module):
     """
-    Backbone for the Diffusion Model (1D ResNet).
-    Predicts noise epsilon given x_t, t, and conditions.
+    Enhanced Backbone for Diffusion Model.
+    - Channel Concat: (Noisy Power, Clear-sky GHI)
+    - Cross-Attention: Backbone attends to (NWP Encoder Output, Site Fingerprint)
     """
     def __init__(self, nwp_dim: int, site_latent_dim: int, hidden_dim: int = 128):
         super().__init__()
@@ -103,55 +110,64 @@ class EpsilonNet(nn.Module):
         # 2. NWP Sequence Encoder
         self.nwp_encoder = NWPEncoder(nwp_dim, hidden_dim)
         
-        # 3. Initial projection of noisy power
-        self.init_conv = nn.Conv1d(1, hidden_dim, kernel_size=3, padding=1)
+        # 3. Site Latent Projection (to match hidden_dim for sequence injection)
+        self.site_proj = nn.Linear(site_latent_dim, hidden_dim)
         
-        # 4. Global condition dimension (Time + Site Latent)
-        global_cond_dim = hidden_dim + site_latent_dim
+        # 4. Initial projection: Input is 2 channels [Noisy Power, GHI Clearsky]
+        self.init_conv = nn.Conv1d(2, hidden_dim, kernel_size=3, padding=1)
         
-        # 5. Residual Blocks (Increased depth to 4)
-        # We concatenate encoded NWP (hidden_dim) with input (hidden_dim), 
-        # so block input is 2*hidden_dim or we use a fusion layer.
-        self.fusion = nn.Conv1d(hidden_dim * 2, hidden_dim, 1)
-        
+        # 5. Fusion & Attention Layers
         self.blocks = nn.ModuleList([
-            ResidualBlock1D(hidden_dim, hidden_dim, global_cond_dim)
+            ResidualBlock1D(hidden_dim, hidden_dim, hidden_dim) # Cond on t_emb only
             for _ in range(4)
         ])
         
+        self.cross_attn = CrossAttentionBlock(hidden_dim)
+        
         self.final_conv = nn.Conv1d(hidden_dim, 1, kernel_size=3, padding=1)
 
-    def forward(self, x_t: torch.Tensor, t: torch.Tensor, nwp: torch.Tensor, site_latent: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, 
+        x_t: torch.Tensor, 
+        t: torch.Tensor, 
+        nwp: torch.Tensor, 
+        site_latent: torch.Tensor,
+        ghi_clearsky: torch.Tensor
+    ) -> torch.Tensor:
         """
-        x_t: [B, seq_len, 1] - Noisy power
-        t: [B] - Diffusion step
-        nwp: [B, seq_len, nwp_dim]
-        site_latent: [B, site_latent_dim]
+        x_t: [B, L, 1]
+        ghi_clearsky: [B, L, 1]
         """
-        x = x_t.transpose(1, 2) # [B, 1, L]
+        # --- 1. Channel Concatenation (Physical Anchor) ---
+        # Concat noisy power and GHI anchor in the channel dimension
+        x_input = torch.cat([x_t, ghi_clearsky], dim=-1) # [B, L, 2]
+        h = self.init_conv(x_input.transpose(1, 2)) # [B, hidden_dim, L]
         
-        # Encode Time and NWP
+        # --- 2. Encode Context (NWP + Site Fingerprint) ---
         t_embed = self.time_mlp(t) # [B, hidden_dim]
         nwp_feat = self.nwp_encoder(nwp.transpose(1, 2)) # [B, hidden_dim, L]
+        site_feat = self.site_proj(site_latent).unsqueeze(1) # [B, 1, hidden_dim]
         
-        # Global Condition
-        global_cond = torch.cat([t_embed, site_latent], dim=-1) # [B, global_cond_dim]
+        # Context for Cross-Attention: Combine dynamic NWP and static Site Fingerprint
+        # context: [B, L+1, hidden_dim]
+        context = torch.cat([nwp_feat.transpose(1, 2), site_feat], dim=1)
         
-        # Fusion of Power features and NWP features
-        h = self.init_conv(x) # [B, hidden_dim, L]
-        h = torch.cat([h, nwp_feat], dim=1) # [B, 2*hidden_dim, L]
-        h = self.fusion(h) # [B, hidden_dim, L]
-        
-        # Pass through Residual Blocks
+        # --- 3. Backbone Processing ---
         for block in self.blocks:
-            h = block(h, global_cond)
+            h = block(h, t_embed)
+            
+        # --- 4. Cross-Attention Fusion ---
+        # Query: h (backbone), Key/Value: context (NWP + Site)
+        h = h.transpose(1, 2) # [B, L, hidden_dim]
+        h = self.cross_attn(h, context) # [B, L, hidden_dim]
+        h = h.transpose(1, 2) # [B, hidden_dim, L]
             
         epsilon_theta = self.final_conv(h)
         return epsilon_theta.transpose(1, 2) # [B, L, 1]
 
 class DiffusionGenerator(nn.Module):
     """
-    Physics-Informed Diffusion Model for PV Power Generation.
+    Physics-Informed Diffusion Model (Refactored with Cross-Attention).
     """
     def __init__(
         self, 
@@ -164,7 +180,6 @@ class DiffusionGenerator(nn.Module):
         self.timesteps = timesteps
         self.eps_net = EpsilonNet(nwp_dim, site_latent_dim, hidden_dim)
         
-        # Diffusion schedules (Linear schedule)
         beta = torch.linspace(1e-4, 0.02, timesteps)
         alpha = 1.0 - beta
         alpha_bar = torch.cumprod(alpha, dim=0)
@@ -177,34 +192,25 @@ class DiffusionGenerator(nn.Module):
         self, 
         real_power: torch.Tensor, 
         nwp: torch.Tensor, 
-        site_latent: torch.Tensor
+        site_latent: torch.Tensor,
+        ghi_clearsky: torch.Tensor
     ) -> Dict[str, torch.Tensor]:
-        """
-        Modified DDPM loss. Returns both MSE and x0_pred for Physics Constraints.
-        """
         B, L, _ = real_power.shape
         t = torch.randint(0, self.timesteps, (B,), device=real_power.device).long()
-        
         noise = torch.randn_like(real_power)
         
-        # q(x_t | x_0)
         a_bar = self.alpha_bar[t].view(B, 1, 1)
         x_t = torch.sqrt(a_bar) * real_power + torch.sqrt(1 - a_bar) * noise
         
-        # Predict noise: epsilon_theta
-        eps_theta = self.eps_net(x_t, t, nwp, site_latent)
+        # Pass ghi_clearsky for channel concat
+        eps_theta = self.eps_net(x_t, t, nwp, site_latent, ghi_clearsky)
         
-        # Standard Diffusion Loss (MSE on noise)
         l_mse = F.mse_loss(eps_theta, noise)
-        
-        # --- Physics-Informed Bridge ---
-        # Derive x0_pred from x_t and eps_theta to apply CPT Loss
-        # x0 = (x_t - sqrt(1 - a_bar) * eps_theta) / sqrt(a_bar)
         x0_pred = (x_t - torch.sqrt(1 - a_bar) * eps_theta) / torch.sqrt(a_bar)
         
         return {
             'l_mse': l_mse,
-            'p_generated': x0_pred # Reconstructed power for CPT Loss
+            'p_generated': x0_pred
         }
 
     @torch.no_grad()
@@ -212,59 +218,33 @@ class DiffusionGenerator(nn.Module):
         self, 
         nwp: torch.Tensor, 
         site_latent: torch.Tensor,
-        ghi_clearsky: Optional[torch.Tensor] = None,
+        ghi_clearsky: torch.Tensor,
         noise_scale: float = 1.0,
         custom_steps: Optional[int] = None
     ) -> torch.Tensor:
-        """
-        Reverse Diffusion Process (Inference).
-        Args:
-            ghi_clearsky: [B, L, 1] Optional physical upper bound.
-            noise_scale: Control the ruggedness/fluctuation strength (Cloud intensity). 
-                         >1.0 for more clouds/ruggedness, <1.0 for smoother.
-            custom_steps: If provided, use a different number of steps for sampling.
-        """
         B, L, _ = nwp.shape
         device = nwp.device
-        
-        # Start from pure noise
         x = torch.randn(B, L, 1, device=device)
         
-        # Determine sampling schedule
-        if custom_steps is not None and custom_steps < self.timesteps:
-            step_indices = np.linspace(0, self.timesteps - 1, custom_steps).astype(int)
-        else:
-            step_indices = np.arange(self.timesteps)
+        step_indices = np.arange(self.timesteps)
             
         for i in reversed(step_indices):
             t = torch.full((B,), i, device=device, dtype=torch.long)
             
-            # Predict noise
-            eps_theta = self.eps_net(x, t, nwp, site_latent)
+            # Pass ghi_clearsky for channel concat
+            eps_theta = self.eps_net(x, t, nwp, site_latent, ghi_clearsky)
             
-            # Reverse step
             a = self.alpha[i]
             a_bar = self.alpha_bar[i]
             beta = self.beta[i]
             
-            if i > 0:
-                # noise_scale > 1.0 will simulate more intense cloud passing/ruggedness
-                noise = torch.randn_like(x) * noise_scale
-            else:
-                noise = 0
-                
-            # x_{t-1} = 1/sqrt(a_t) * (x_t - (1-a_t)/sqrt(1-a_bar_t) * eps_theta) + sigma_t * z
+            noise = torch.randn_like(x) * noise_scale if i > 0 else 0
             x = (1 / torch.sqrt(a)) * (x - ((1 - a) / torch.sqrt(1 - a_bar)) * eps_theta) + torch.sqrt(beta) * noise
             
-            # --- Physical Constraints Step-by-Step ---
-            # Power cannot be negative
             x = torch.clamp(x, min=0.0)
+            x = torch.min(x, ghi_clearsky.to(device))
             
-            # Optional: Clip by clear-sky GHI if provided
-            if ghi_clearsky is not None:
-                x = torch.min(x, ghi_clearsky.to(device))
-            
-        return x # Generated Power [B, L, 1]
+        return x
 
 if __name__ == "__main__":
     # Test Diffusion Generator

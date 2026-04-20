@@ -11,9 +11,18 @@ class ModelConfig:
     memory_input_dim: int = 8 
     
     # Sequences
-    history_len: int = 0   # No longer used for generation
-    future_len: int = 96   # 1 day @ 15min
-    total_len: int = 96    # Matches future_len
+    context_len: int = 96 * 14  # 14 days context for fingerprinting
+    future_len: int = 96       # 1 day target generation
+    
+    # Training Stages
+    # Stage 1: Contrastive Learning for Codebook
+    contrastive_temperature: float = 0.07
+    stage1_batch_size: int = 64
+    stage1_lr: float = 1e-3
+    
+    # Stage 2: Generator training
+    stage2_batch_size: int = 32
+    stage2_lr: float = 1e-4
     
     # Diffusion
     timesteps: int = 100

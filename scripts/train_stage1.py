@@ -106,12 +106,31 @@ def train_stage1(
             ghi_cs = batch['ghi_clearsky'].to(device)
             site_id = batch['site_id'].to(device)
             
-            # --- Identity Adaptation ---
+            # --- Identity Adaptation (with Grouped Aggregation) ---
             context_data = torch.cat([nwp, power], dim=-1)
-            site_latent = memory_bank(context_data=context_data)
+            raw_queries = memory_bank.get_query(context_data) # [B, latent_dim]
+            
+            # Group by site_id and calculate mean query per site in the batch
+            unique_site_ids, inverse_indices = torch.unique(site_id, return_inverse=True)
+            grouped_queries = torch.zeros(len(unique_site_ids), raw_queries.size(1), device=device)
+            grouped_queries.index_add_(0, inverse_indices, raw_queries)
+            
+            counts = torch.bincount(inverse_indices).view(-1, 1)
+            grouped_queries = grouped_queries / counts
+            
+            # Broadcast grouped queries back to original batch size
+            batch_queries = grouped_queries[inverse_indices] # [B, latent_dim]
+            
+            # Match with Codebook to get final steady-state fingerprint
+            site_latent = memory_bank.match_codebook(batch_queries) # [B, latent_dim]
             
             # --- Diffusion Training (with Physics Constraint) ---
-            res = generator.compute_loss(power, nwp, site_latent)
+            res = generator.compute_loss(
+                real_power=power, 
+                nwp=nwp, 
+                site_latent=site_latent,
+                ghi_clearsky=ghi_cs
+            )
             
             # CPT Loss on the reconstructed p_generated (x0)
             cpt_results = criterion(

@@ -84,93 +84,99 @@ def compute_time_features_series(
 class PVDataset(Dataset):
     """
     Physics-Informed Dataset for Multi-site PV Generation.
-    
-    Data Structure expected in input DataFrame:
-    - timestamp_win: Base timestamp for each sequence (15min resolution).
-    - observe_power_future: np.ndarray [future_len] (Future power)
-    - GHI_solargis_future: np.ndarray [future_len] (Future NWP GHI)
-    - TEMP_solargis_future: np.ndarray [future_len] (Future NWP Temperature)
-    - station: Station ID
-    - ghi_clearsky: Optional[np.ndarray] [future_len] (Pre-computed clear-sky GHI)
-    - time_features: Optional[np.ndarray] [future_len, 4] (Pre-computed time features)
+    Supports Stage 1 (Contrastive Fingerprinting) and Stage 2 (Conditional Generation).
     """
     
     def __init__(
         self, 
         df: pd.DataFrame, 
         station_metadata: Dict[Any, Dict[str, float]], 
-        history_len: int = 672, 
-        future_len: int = 192
+        context_len: int = 96 * 14, 
+        future_len: int = 96
     ):
-        """
-        Args:
-            df: DataFrame containing the PV data.
-            station_metadata: Dict mapping station_id to {'lat': float, 'lon': float, 'tz': str}.
-            history_len: Length of historical sequence (default 7 days @ 15min).
-            future_len: Length of future sequence (default 2 days @ 15min).
-        """
         self.df = df
         self.station_metadata = station_metadata
-        self.history_len = history_len
+        self.context_len = context_len
         self.future_len = future_len
-        self.total_len = history_len + future_len
         
-        # 1. Handle Clearsky GHI (Check if pre-computed in DF)
-        if 'ghi_clearsky' in self.df.columns:
-            print("Using pre-computed clearsky GHI from DataFrame.")
-            self.clearsky_ghi_all = np.stack(self.df['ghi_clearsky'].values)
-        else:
-            print(f"Pre-computing clearsky GHI for {len(df)} samples...")
-            self.clearsky_ghi_all = compute_clearsky_series(df, station_metadata, future_len)
+        # Group indices by station to facilitate same-site sampling
+        self.station_groups = df.groupby('station').indices
+        self.station_list = list(self.station_groups.keys())
         
-        # 2. Handle Time Features (Check if pre-computed in DF)
-        if 'time_features' in self.df.columns:
-            print("Using pre-computed time features from DataFrame.")
-            self.time_feats_all = np.stack(self.df['time_features'].values)
-        else:
-            print(f"Pre-computing time features for {len(df)} samples...")
-            self.time_feats_all = compute_time_features_series(df, station_metadata, future_len)
+        # Pre-compute clearsky GHI and time features for all samples (Target Window only)
+        # In a real system, we'd pre-compute or compute on-the-fly.
+        # For simplicity, we assume the input df has 'GHI_solargis_future' for the 1-day target.
+        print(f"Pre-computing features for {len(df)} samples...")
+        self.clearsky_ghi_all = compute_clearsky_series(df, station_metadata, future_len)
+        self.time_feats_all = compute_time_features_series(df, station_metadata, future_len)
 
     def __len__(self) -> int:
         return len(self.df)
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        # Use iterative retry instead of recursion to avoid stack overflow
-        max_retries = 10
-
-        for _ in range(max_retries):
-            row = self.df.iloc[idx]
-            station_id = row['station']
+    def _get_single_view(self, idx: int, is_context: bool = True) -> torch.Tensor:
+        """Helper to construct the [Seq, 8] feature tensor for a specific window."""
+        row = self.df.iloc[idx]
+        
+        if is_context:
+            # Context window (e.g. 14 days)
+            # For simplicity, we assume GHI/TEMP/Power are available for context_len
+            ghi = row['GHI_solargis'][:self.context_len]
+            temp = row['TEMP_solargis'][:self.context_len]
+            power = row['observe_power'][:self.context_len]
             
-            # Use pre-computed clearsky GHI and time features
-            ghi_clearsky = self.clearsky_ghi_all[idx]
-            time_feats = self.time_feats_all[idx]
-
-            # Only use the first future_len steps of the future data
-            power = row['observe_power_future'][:self.future_len]
-
-            # NWP features: [future_len, 2] (GHI, TEMP)
+            # Pad with zeros for missing NWP features (Hour_Sin etc.) if not available for context
+            # In production, we'd compute full NWP for context too.
+            # Here we just use [GHI, Temp, Power, 0, 0, 0, 0, 0] to match input_dim=8
+            feat = np.zeros((self.context_len, 8), dtype=np.float32)
+            feat[:, 0] = ghi
+            feat[:, 1] = temp
+            feat[:, 2] = power
+            return torch.tensor(feat, dtype=torch.float32)
+        else:
+            # Target window (1 day) - Full 7 NWP features
+            ghi_cs = self.clearsky_ghi_all[idx]
+            time_f = self.time_feats_all[idx]
             nwp_ghi = row['GHI_solargis_future'][:self.future_len]
             nwp_temp = row['TEMP_solargis_future'][:self.future_len]
-            nwp_base = np.stack([nwp_ghi, nwp_temp], axis=-1)
+            
+            # Base NWP (GHI, TEMP) + ClearSky + TimeFeats (4) = 7
+            nwp_full = np.concatenate([
+                nwp_ghi[:, None], 
+                nwp_temp[:, None], 
+                ghi_cs[:, None], 
+                time_f
+            ], axis=-1)
+            return torch.tensor(nwp_full, dtype=torch.float32)
 
-            # --- Anomaly Filtering ---
-            high_ghi = (ghi_clearsky > 500)
-            is_zero_power = (power == 0)
-
-            if high_ghi.sum() > 0 and (is_zero_power & high_ghi).sum() > 0.1 * high_ghi.sum():
-                idx = np.random.randint(0, len(self))
-                continue
-
-            break
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        row = self.df.iloc[idx]
+        station_id = row['station']
         
-        # Final NWP feature tensor: Base NWP + Clear-sky GHI + Time Features
-        nwp_full = np.concatenate([nwp_base, ghi_clearsky[:, np.newaxis], time_feats], axis=-1)
+        # View 1: Context Anchor (History at time T1)
+        context_anchor = self._get_single_view(idx, is_context=True)
+        
+        # View 2: Context Positive (Another time T2 for same station)
+        station_indices = self.station_groups[station_id]
+        if len(station_indices) > 1:
+            pos_idx = np.random.choice(station_indices)
+            # Ensure it's a different time window if possible
+            while pos_idx == idx and len(station_indices) > 5:
+                pos_idx = np.random.choice(station_indices)
+        else:
+            pos_idx = idx
+        context_pos = self._get_single_view(pos_idx, is_context=True)
+        
+        # Target Data for generation (at time T1)
+        target_nwp = self._get_single_view(idx, is_context=False)
+        target_power = torch.tensor(row['observe_power_future'][:self.future_len], dtype=torch.float32).unsqueeze(-1)
+        ghi_cs = torch.tensor(self.clearsky_ghi_all[idx], dtype=torch.float32).unsqueeze(-1)
         
         return {
-            'nwp': torch.tensor(nwp_full, dtype=torch.float32),
-            'ghi_clearsky': torch.tensor(ghi_clearsky, dtype=torch.float32).unsqueeze(-1),
-            'power': torch.tensor(power, dtype=torch.float32).unsqueeze(-1),
+            'context_anchor': context_anchor, # [Context_Len, 8]
+            'context_pos': context_pos,       # [Context_Len, 8]
+            'target_nwp': target_nwp,         # [Future_Len, 7]
+            'target_power': target_power,     # [Future_Len, 1]
+            'ghi_clearsky': ghi_cs,           # [Future_Len, 1]
             'site_id': torch.tensor(int(station_id), dtype=torch.long)
         }
 
