@@ -51,6 +51,20 @@
     $$\mathcal{L}_{stage1} = -\log \frac{\exp(sim(z_1, z_2)/\tau)}{\sum \exp(sim(z_1, z_{neg})/\tau)}$$
 
 ### 3.2 损失函数详解 (CPT Loss Breakdown)
+
+#### 3.2.1 生成功率 ($P_{gen}$) 的计算逻辑
+在训练阶段，为了计算物理一致性损失，需要从当前的带噪状态 $x_t$ 中导出对原始干净功率序列 $x_0$ 的估计值。本模型采用**单步重建 (One-step Reconstruction)** 逻辑：
+
+利用扩散模型预测的噪声 $\epsilon_\theta$，通过以下公式导出 $P_{gen}$（即 $\hat{x}_0$）：
+$$P_{gen} = \frac{x_t - \sqrt{1 - \bar{\alpha}_t} \cdot \epsilon_\theta}{\sqrt{\bar{\alpha}_t}}$$
+其中：
+*   $x_t$：$t$ 时刻的带噪功率张量。
+*   $\epsilon_\theta$：网络预测的噪声。
+*   $\bar{\alpha}_t$：扩散过程中的累积乘法系数。
+
+**注意**：所有后续的物理约束项（$\mathcal{L}_{bound}, \mathcal{L}_{fluct}, \mathcal{L}_{mono}$）均是基于此导出的 $P_{gen}$ 与真实值 $P_{real}$ 之间进行计算的。
+
+#### 3.2.2 损失项拆解
 总损失函数由扩散重建损失与物理一致性传输 (CPT) 约束项加权组成：
 $$\mathcal{L}_{total} = \mathcal{L}_{mse} + \alpha \mathcal{L}_{bound} + \gamma \mathcal{L}_{fluct} + \delta \mathcal{L}_{mono}$$
 
