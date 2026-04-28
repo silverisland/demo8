@@ -50,11 +50,22 @@
 *   **损失函数**：采用 InfoNCE Loss，温度系数 $\tau=0.07$。
     $$\mathcal{L}_{stage1} = -\log \frac{\exp(sim(z_1, z_2)/\tau)}{\sum \exp(sim(z_1, z_{neg})/\tau)}$$
 
-### Stage 2: 物理约束生成训练 (Conditional Generation)
-*   **损失函数**：$\mathcal{L}_{total} = \mathcal{L}_{mse} + 10.0 \cdot \mathcal{L}_{physics} + 0.5 \cdot \mathcal{L}_{fluctuation}$
-*   **CPT Loss 实现关键点**：
-    1.  **物理边界项**：$\text{Mean}(\text{ReLU}(P_{gen} - GHI_{cs})^2)$。
-    2.  **反平滑波动项**：计算一阶差分 $\nabla P = P_t - P_{t-1}$，使 $\text{MAE}(|\nabla P_{gen}|, |\nabla P_{real}|)$ 最小化。
+### 3.2 损失函数详解 (CPT Loss Breakdown)
+总损失函数由扩散重建损失与物理一致性传输 (CPT) 约束项加权组成：
+$$\mathcal{L}_{total} = \mathcal{L}_{mse} + \alpha \mathcal{L}_{bound} + \gamma \mathcal{L}_{fluct} + \delta \mathcal{L}_{mono}$$
+
+1.  **扩散重建损失 ($\mathcal{L}_{mse}$)**：
+    *   **公式**：$\mathcal{L}_{mse} = \text{MSE}(\epsilon_\theta, \epsilon)$
+    *   **描述**：标准的 DDPM 噪声匹配损失。通过预测注入的噪声 $\epsilon$，隐含地学习功率序列的时空分布。
+2.  **物理边界惩罚 ($\mathcal{L}_{bound}$)**：
+    *   **公式**：$\mathcal{L}_{bound} = \text{Mean}(\text{ReLU}(P_{gen} - G_{cs})^2)$
+    *   **描述**：**保密逻辑关键点**。利用 `pvlib` 计算的晴空辐射 $G_{cs}$ 作为硬性上限。当生成功率 $P_{gen}$ 超过理论上限时，ReLU 激活函数触发重度惩罚，强制模型建立能量守恒意识。
+3.  **反平滑波动匹配 ($\mathcal{L}_{fluct}$)**：
+    *   **公式**：$\mathcal{L}_{fluct} = \text{MSE}(|\nabla P_{gen}|, |\nabla P_{real}|)$，其中 $\nabla P_t = P_t - P_{t-1}$。
+    *   **描述**：**解决失真核心**。传统模型生成的序列往往过于平滑。该项通过匹配真实数据与生成数据的一阶差分绝对值（即“崎岖度”），强制模型模拟出真实的云层遮挡波动感。
+4.  **趋势一致性约束 ($\mathcal{L}_{mono}$)**：
+    *   **公式**：$\mathcal{L}_{mono} = \text{Mean}(\text{ReLU}(- \nabla P_{gen} \cdot \nabla G_{cs}))$
+    *   **描述**：约束生成序列的单调趋势。例如，当太阳辐射 $\nabla G_{cs}$ 显著上升时，功率 $\nabla P_{gen}$ 不应出现非物理的剧烈下降。通过点积符号检测趋势冲突并施加惩罚。
 
 ---
 
